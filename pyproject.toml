@@ -1,0 +1,21 @@
+[project]
+name = "mvibe"
+version = "0.1.0"
+description = "Mirror a local Claude Code TUI to a remote chat (WeChat). Local stays identical; remote takes over I/O via a flag file."
+requires-python = ">=3.11"
+dependencies = [
+    "segno>=1.6",
+]
+
+[project.scripts]
+mvibe = "mvibe.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["mvibe"]
+
+[tool.ruff]
+line-length = 100
