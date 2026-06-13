@@ -37,9 +37,12 @@
 ## 安装
 
 ```bash
-uv tool install --editable /path/to/mvibe   # 把 mvibe 装上全局 PATH
-mvibe login                                  # 一次性：扫码绑定微信 bot
+uv tool install --editable /path/to/mvibe    # 把 mvibe 装上全局 PATH
+cp /path/to/mvibe/commands/mvibe-*.md ~/.claude/commands/   # 装会话内 slash 开关
+mvibe login                                   # 一次性：扫码绑定微信 bot
 ```
+
+依赖仅 `aiohttp` + `segno`（PyPI），**零 avibe 依赖**。
 
 ## 用法（单终端，推荐）
 
@@ -131,3 +134,30 @@ iLink 协议代码 vendored 在 `mvibe/ilink/`（`wechat_api.py` / `wechat_auth.
   长时间空闲后推送可能报 errcode -14。
 - 键盘注入以 CR 提交；多行文本可能提前断行提交。
 - 两端必须用**相同 cwd**（transcript 目录按 cwd 编码）。
+
+## 项目结构
+
+```
+mvibe/
+  cli.py          命令行（argparse）：默认/up/run/bridge/login/remote/send/flag/status
+  wrapper.py      PTY mux 核心：本地透传 + flag 路由 + 本地按键夺回 + 注入消毒
+  bridge.py       后台：transcript→微信镜像 + 微信入站 poll + HTTP 接收
+  tailer.py       follow transcript .jsonl，抽 assistant text
+  wechat_in.py    iLink getUpdates 长轮询入站
+  wechat_out.py   iLink send_message 出站
+  wechat_login.py QR 扫码绑定
+  config.py       ~/.mvibe 凭证/tokens/sync_buf（0600）
+  paths.py        路径布局 + flag/gate + cwd→transcript 编码
+  _tls.py         可选 CA bundle
+  ilink/          vendored iLink 协议（wechat_api.py / wechat_auth.py，仅 aiohttp）
+commands/         Claude slash 命令模板（/mvibe-on /off /status）
+scripts/smoke.sh  本地自测（无微信、隔离 HOME）
+```
+
+## 自测
+
+```bash
+bash scripts/smoke.sh    # 9 项：注入/flag 互斥/消毒/HTTP/token/权限/tailer
+```
+
+不碰真 `~/.mvibe`（用隔离 `MVIBE_HOME`），无网络无微信，安全可随时跑。
