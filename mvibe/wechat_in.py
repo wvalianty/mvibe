@@ -10,7 +10,8 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 
-from . import _avibe, config
+from . import _tls, config
+from .ilink import wechat_api
 
 _POLL_TIMEOUT_MS = 30_000
 _SHORT_RETRY_S = 2
@@ -38,9 +39,7 @@ def _extract_text(msg: dict) -> str:
 
 
 async def poll_forever(on_message: OnMessage, stop: asyncio.Event | None = None) -> None:
-    _avibe.ensure_imports()
-    _avibe.setup_tls_ca()
-    from modules.im import wechat_api
+    _tls.setup_tls_ca()
 
     creds = config.wechat_creds()
     base_url, bot_token = creds["base_url"], creds["bot_token"]

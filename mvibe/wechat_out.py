@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import asyncio
 
-from . import _avibe, config
+from . import _tls, config
+from .ilink import wechat_api
 
 SESSION_EXPIRED_ERRCODE = -14
 
@@ -19,8 +20,6 @@ class WeChatError(RuntimeError):
 
 
 async def _send(base_url, bot_token, user_id, context_token, text) -> dict:
-    from modules.im import wechat_api
-
     item_list = [{"type": 1, "text_item": {"text": text}}]
     return await wechat_api.send_message(base_url, bot_token, user_id, context_token, item_list)
 
@@ -35,11 +34,7 @@ def send_text(text: str, user: str | None = None) -> str:
     text = (text or "").strip()
     if not text:
         raise WeChatError("empty text")
-    try:
-        _avibe.ensure_imports()
-    except _avibe.AvibeUnavailable as exc:
-        raise WeChatError(str(exc)) from exc
-    _avibe.setup_tls_ca()
+    _tls.setup_tls_ca()
 
     creds = config.wechat_creds()
     if not creds["bot_token"]:

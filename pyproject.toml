@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Mirror a local Claude Code TUI to a remote chat (WeChat). Local stays identical; remote takes over I/O via a flag file."
 requires-python = ">=3.11"
 dependencies = [
+    "aiohttp>=3.9",
     "segno>=1.6",
 ]
 
@@ -19,3 +20,4 @@ packages = ["mvibe"]
 
 [tool.ruff]
 line-length = 100
+extend-exclude = ["mvibe/ilink"]  # vendored upstream iLink code

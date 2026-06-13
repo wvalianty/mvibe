@@ -1,9 +1,8 @@
 """mvibe's own config + WeChat state store under ~/.mvibe.
 
-Self-contained: holds the bot_token obtained by `mvibe login`, the long-poll
-sync cursor, and per-user context_tokens observed from inbound messages. Never
-writes to ~/.vibe_remote; only *reads* it as a fallback so an existing avibe
-login still lets you push before running `mvibe login`.
+Fully self-contained: holds the bot_token obtained by `mvibe login`, the
+long-poll sync cursor, and per-user context_tokens observed from inbound
+messages. No dependency on any avibe install.
 """
 
 from __future__ import annotations
@@ -16,10 +15,6 @@ from pathlib import Path
 from . import paths
 
 DEFAULT_BASE_URL = "https://ilinkai.weixin.qq.com"
-
-# Read-only fallbacks to an existing avibe install.
-_AVIBE_CONFIG = Path.home() / ".vibe_remote/config/config.json"
-_AVIBE_TOKENS = Path.home() / ".vibe_remote/state/wechat_context_tokens.json"
 
 
 def _secure_dir(path: Path) -> None:
@@ -65,22 +60,14 @@ def save_config(patch: dict) -> None:
     _secure_write(paths.CONFIG_PATH, json.dumps(cfg, indent=2, ensure_ascii=False))
 
 
-def _avibe_wechat() -> dict:
-    try:
-        data = json.loads(_AVIBE_CONFIG.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-    return data.get("wechat") or {}
-
-
 def wechat_creds() -> dict:
-    """Resolve {base_url, bot_token, user_id}, mvibe config first, avibe fallback."""
+    """Resolve {base_url, bot_token, user_id} from mvibe config."""
     mine = load_config().get("wechat") or {}
-    fallback = _avibe_wechat()
-    base_url = mine.get("base_url") or fallback.get("base_url") or DEFAULT_BASE_URL
-    bot_token = mine.get("bot_token") or fallback.get("bot_token") or ""
-    user_id = mine.get("user_id") or ""
-    return {"base_url": base_url, "bot_token": bot_token, "user_id": user_id}
+    return {
+        "base_url": mine.get("base_url") or DEFAULT_BASE_URL,
+        "bot_token": mine.get("bot_token") or "",
+        "user_id": mine.get("user_id") or "",
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -120,10 +107,7 @@ def _load_tokens_file(path: Path) -> dict[str, dict]:
 
 
 def load_tokens() -> dict[str, dict]:
-    """mvibe tokens merged over avibe tokens (mvibe wins on conflict)."""
-    merged = _load_tokens_file(_AVIBE_TOKENS)
-    merged.update(_load_tokens_file(paths.WECHAT_TOKENS))
-    return merged
+    return _load_tokens_file(paths.WECHAT_TOKENS)
 
 
 def remember_context_token(user_id: str, context_token: str) -> None:

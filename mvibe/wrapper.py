@@ -53,8 +53,13 @@ def _open_inject_fifo() -> int:
     return fd
 
 
-def run(cmd: list[str]) -> int:
-    """Spawn cmd under a PTY and mux I/O until it exits. Returns exit code."""
+def run(cmd: list[str], on_ready=None) -> int:
+    """Spawn cmd under a PTY and mux I/O until it exits. Returns exit code.
+
+    `on_ready` (if given) is called once the PTY child and inject FIFO reader are
+    live but before the mux loop — used by `mvibe up` to start the bridge threads
+    in-process only after a FIFO reader exists (so injects never hit ENXIO).
+    """
     if not cmd:
         cmd = ["claude"]
 
@@ -80,6 +85,12 @@ def run(cmd: list[str]) -> int:
         old_attr = termios.tcgetattr(stdin_fd)
         tty.setraw(stdin_fd)
 
+    if on_ready is not None:
+        try:
+            on_ready()
+        except Exception:
+            pass  # bridge startup must never take down the local TUI
+
     try:
         while True:
             try:
@@ -103,9 +114,14 @@ def run(cmd: list[str]) -> int:
                     data = os.read(stdin_fd, _BUF)
                 except OSError:
                     data = b""
-                if data and mode == "local":
+                if data:
+                    # Local activity always reclaims control: the human at the
+                    # keyboard outranks remote. This is the escape hatch out of
+                    # remote mode (so you can always type, e.g. `/mvibe-off`).
+                    if mode == "remote":
+                        paths.write_flag("local")
+                        mode = "local"
                     os.write(master_fd, data)
-                # remote mode: local keystrokes are dropped on purpose.
 
             if inject_fd in rlist:
                 try:

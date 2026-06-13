@@ -11,7 +11,8 @@ from __future__ import annotations
 import asyncio
 import time
 
-from . import _avibe, config
+from . import _tls, config
+from .ilink.wechat_auth import WeChatAuthManager
 
 POLL_INTERVAL = 2
 MAX_WAIT_S = 240
@@ -28,9 +29,7 @@ def _render_qr(url: str) -> None:
 
 
 async def _login() -> int:
-    _avibe.ensure_imports()
-    _avibe.setup_tls_ca()
-    from modules.im.wechat_auth import WeChatAuthManager
+    _tls.setup_tls_ca()
 
     base_url = config.wechat_creds()["base_url"]
     mgr = WeChatAuthManager()

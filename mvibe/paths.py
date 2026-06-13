@@ -1,8 +1,7 @@
 """Filesystem layout and Claude transcript discovery.
 
-mvibe keeps its own runtime state under ~/.mvibe and never mutates ~/.avibe or
-~/.vibe_remote. It only *reads* the Claude transcript directory and (for output)
-the avibe WeChat config/tokens.
+mvibe keeps all its runtime state under ~/.mvibe and reads only the Claude
+transcript directory (~/.claude/projects). No dependency on any avibe install.
 """
 
 from __future__ import annotations
@@ -20,8 +19,11 @@ FLAG_PATH = MVIBE_HOME / "active"
 INJECT_FIFO = MVIBE_HOME / "inject"
 # Optional: SessionStart hook may write the active session id / transcript path here.
 SESSION_PATH = MVIBE_HOME / "session"
+# Remote takeover gate: when "off", inbound WeChat messages are ignored entirely
+# (the /remote-off skill). Absent file defaults to enabled.
+REMOTE_GATE = MVIBE_HOME / "remote_enabled"
 
-# mvibe owns its own WeChat bot credentials/state (does not touch ~/.vibe_remote).
+# mvibe owns its own WeChat bot credentials/state.
 CONFIG_PATH = MVIBE_HOME / "config.json"
 WECHAT_SYNC_BUF = STATE_DIR / "wechat_sync_buf"
 WECHAT_TOKENS = STATE_DIR / "wechat_context_tokens.json"
@@ -52,6 +54,21 @@ def write_flag(mode: str) -> None:
     ensure_home()
     mode = "remote" if mode == "remote" else "local"
     FLAG_PATH.write_text(mode, encoding="utf-8")
+
+
+def remote_enabled() -> bool:
+    """Whether remote takeover is allowed. Absent file -> enabled (default on)."""
+    try:
+        return REMOTE_GATE.read_text(encoding="utf-8").strip() != "off"
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return True
+
+
+def set_remote_enabled(enabled: bool) -> None:
+    ensure_home()
+    REMOTE_GATE.write_text("on" if enabled else "off", encoding="utf-8")
 
 
 def encode_cwd(cwd: Path) -> str:

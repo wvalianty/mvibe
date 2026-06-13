@@ -1,21 +1,21 @@
 # mvibe
 
 把本地 **Claude Code** TUI 镜像到远程聊天（微信）。本地终端与直接运行 `claude`
-逐字节一致；一个标志文件决定是否由远程接管输入/输出。**全程只有一个 `claude`
-进程**——切换只是 I/O 路由开关，不重启、不交接会话。
+逐字节一致；两个开关（输入路由 `flag` + 输出/入站总闸 `gate`）决定远程接管程度。
+**全程只有一个 `claude` 进程**——切换只是 I/O 路由，不重启、不交接会话。
 
 ## 工作原理
 
 ```
             ┌──────────── mvibe run（持 PTY master）────────────┐
- 终端   ────┤ stdin → PTY     （仅 flag=local 时）             │
-        ←───┤ PTY  → stdout   （始终；remote 时也能围观）       │──► claude TUI
-            │ inject FIFO → PTY（仅 flag=remote 时）            │     （单进程）
+ 终端   ────┤ stdin → PTY     （local 路由；一敲键即夺回）       │
+        ←───┤ PTY  → stdout   （始终；远程驱动时也能围观）       │──► claude TUI
+            │ inject FIFO → PTY（remote 路由时）                │     （单进程）
             └───────────────────────────────────────────────────┘        │ 写入
                                                           .jsonl ◄─────────┘
- 微信 ──POST /inbound──► inject FIFO + flag=remote               │
+ 微信 ──入站──► inject FIFO + flag=remote                        │
      ◄── 推送(iLink) ── tail transcript .jsonl（assistant text）◄─┘
-                              [mvibe bridge]
+                       [mvibe bridge]（出站受 remote gate 控制）
 ```
 
 - **本地保持真 TUI**（富渲染、slash 命令、plan mode）：PTY 透明透传，即
@@ -23,50 +23,91 @@
 - **远程输出 ≠ 裸 ANSI**：从会话 transcript（`~/.claude/projects/<cwd>/<id>.jsonl`）
   读，而非镜像 PTY 字节——TUI 的 ANSI 流在聊天框里是乱码。
 - **远程输入**：当作键盘注入 PTY，驱动真 TUI。
-- **切换** = `~/.mvibe/active` 的内容（`local` | `remote`）。它同时是互斥锁：
-  `remote` 丢本地键盘，`local` 丢注入，杜绝两人同敲。
 
-## 用法
+### 两个开关，别搞混
+
+- **`flag`（`~/.mvibe/active`，local|remote）= 输入路由**：谁的键盘进 claude。
+  入站消息置 `remote`；**本地敲任意键立即翻回 `local` 并夺回控制**（human 优先，
+  永不锁死）。这是输入端互斥，杜绝两人同敲。
+- **`gate`（remote on/off）= 输出镜像 + 入站总闸**：决定是否把 claude 回复推手机、
+  是否接受手机消息。`/mvibe-on` 开、`/mvibe-off` 关。
+- 二者解耦：所以你本地夺回打字（flag=local）时，回复仍会推手机（gate 仍 on）；
+  要彻底断开手机，`/mvibe-off`。
+
+## 安装
 
 ```bash
-uv run mvibe login               # 一次性：扫码绑定一个微信 bot
-uv run mvibe run                 # 终端1：包装版 claude，照常用
-uv run mvibe bridge --cwd .      # 终端2：镜像输出 + 微信入站轮询
-
-uv run mvibe flag remote         # 交给远程
-uv run mvibe send "继续"          # 注入一行到当前会话
-uv run mvibe flag local          # 收回本地
-uv run mvibe status
+uv tool install --editable /path/to/mvibe   # 把 mvibe 装上全局 PATH
+mvibe login                                  # 一次性：扫码绑定微信 bot
 ```
 
-手机端：先给 bot 发一条消息建立会话，之后你发的内容会驱动当前 Claude TUI；
-Claude 的回复以聊天消息返回。
+## 用法（单终端，推荐）
 
-也可纯 HTTP 驱动（无需微信）：
+进到想用 claude 的目录，直接 `mvibe`——**裸 `mvibe` 等价于在当前目录 `mvibe up`**：
+同一终端前台跑 claude TUI，后台跑 bridge（镜像输出 + 微信入站轮询）。桥日志写
+`~/.mvibe/bridge.log`，不污染界面。
 
 ```bash
-curl -X POST --data '继续' localhost:8765/inbound
-curl -X POST localhost:8765/flag/local
+cd /path/to/project
+mvibe                 # = mvibe up，cwd 即当前目录
+```
+
+等价写法：`mvibe up`（同上）、`mvibe up --cwd /other/dir`（指定目录）。
+
+手机端：先给 bot 发一条消息建立会话，之后你发的内容驱动这个 Claude TUI，
+Claude 的回复以聊天消息返回。退出 claude（`/exit`）即整体结束。
+
+### 会话内开关（Claude slash 命令）
+
+把 `commands/mvibe-*.md` 拷到 `~/.claude/commands/`，即可在任意会话里：
+
+| 命令 | 作用 |
+|------|------|
+| `/mvibe-on`     | 开启远程接管（微信驱动会话） |
+| `/mvibe-off`    | 关闭远程接管（忽略微信，保持本地） |
+| `/mvibe-status` | 查看 remote 开关 / 路由 flag / transcript |
+
+`mvibe up` 默认 remote=on（`--no-remote` 可改）。
+
+**夺回控制**：远程接管时本地键盘被让出，但**只要你在本地敲任意键，立即夺回
+本地控制**（human 在场优先）——所以你永远不会被锁死，可随时打字。想彻底不让
+手机再抢，敲 `/mvibe-off`（关闭 gate）。下次手机消息会再次接管，除非 gate 关着。
+
+### 两终端模式（可选）
+
+```bash
+mvibe run --cwd .       # 终端1：claude TUI（必须先起）
+mvibe bridge --cwd .    # 终端2：镜像 + 入站
+```
+
+### 直接命令 / HTTP
+
+```bash
+mvibe remote on|off|status      # 远程接管开关
+mvibe flag remote|local         # 仅切路由
+mvibe send "继续"                # 注入一行
+curl -X POST --data '继续' localhost:8765/inbound   # HTTP 驱动（无需微信）
 ```
 
 ## 微信：独立 bot
 
-mvibe 端到端自持微信 bot——无需 avibe service、无需公网 webhook：
+mvibe 端到端自持微信 bot——**零 avibe 依赖**、无需 service、无需公网 webhook：
 
-- **绑定**（`mvibe login`，`wechat_login.py`）：经 avibe `WeChatAuthManager`
-  跑官方 iLink 扫码流程，把 `bot_token` / `base_url` / `user_id` 写入 **mvibe
-  自己的** `~/.mvibe/config.json`。
-- **入站**（`wechat_in.py`）：iLink `getUpdates` 长轮询循环，无需 webhook/公网。
+- **绑定**（`mvibe login`，`wechat_login.py`）：跑官方 iLink 扫码流程，把
+  `bot_token` / `base_url` / `user_id` 写入 `~/.mvibe/config.json`。
+- **入站**（`wechat_in.py`）：iLink `getUpdates` 长轮询，无需 webhook/公网。
   每条消息产出 `(text, user_id)`，置 flag 为 `remote` 并把文本注入 PTY。同步游标
   与每用户 `context_token` 持久化在 `~/.mvibe/state/`。
-- **出站**（`wechat_out.py`）：`send_message`，用记住的 `context_token` 寻址。
+- **出站**（`wechat_out.py`）：tailer 读到的 assistant 文本经 `send_message`
+  推手机，用记住的 `context_token` 寻址。**只在 remote gate 开启时推送**（跟 gate
+  走，不跟 flag），所以本地按键夺回输入不会吞掉回复。失败写 `~/.mvibe/bridge.log`
+  （如 `errcode -14` 会话过期，需手机再发条消息刷新）。
 
-协议代码运行时借用 avibe 的 `modules.im.*`（把其 venv 的 site-packages 拼到
-`sys.path`）；mvibe 自身不内置。
+iLink 协议代码 vendored 在 `mvibe/ilink/`（`wechat_api.py` / `wechat_auth.py`，
+源自 avibe，仅依赖 `aiohttp` + stdlib）。mvibe 不在运行时引用任何 avibe 安装。
 
-> 请跑**自己**的 `mvibe login`，不要复用 avibe 的 bot_token：同一 bot 上两个
-> `getUpdates` 轮询会争抢同步游标。若复用 avibe 凭证（自动 fallback），先停掉
-> avibe 的微信适配器。
+> 一个 bot_token 上不要同时跑两个 `getUpdates` 轮询（会争同步游标）。mvibe 有自己
+> 的登录/bot，与任何 avibe 实例互不干扰。
 
 ## 安全
 

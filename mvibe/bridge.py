@@ -32,6 +32,22 @@ _MAX_BODY = 64 * 1024  # cap inbound POST bodies (DoS guard)
 # Optional shared secret; when set, /inbound and /flag/* require X-MVIBE-Token.
 _HTTP_TOKEN = os.environ.get("MVIBE_HTTP_TOKEN", "")
 
+# When the bridge runs inside `mvibe up` (same terminal as the claude TUI), its
+# logs must NOT hit stdout or they corrupt the full-screen TUI. _LOG_PATH
+# redirects them to a file instead.
+_LOG_PATH: Path | None = None
+
+
+def _log(msg: str) -> None:
+    if _LOG_PATH is None:
+        print(msg, flush=True)
+        return
+    try:
+        with _LOG_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(msg + "\n")
+    except OSError:
+        pass
+
 
 def _chunk(text: str, size: int = _MAX_CHUNK):
     for i in range(0, len(text), size):
@@ -41,15 +57,23 @@ def _chunk(text: str, size: int = _MAX_CHUNK):
 def _mirror_loop(cwd: Path | None, always: bool, user: str | None) -> None:
     from . import wechat_out
 
+    # Output mirroring follows the remote *gate* (the /mvibe-on/off switch), NOT
+    # the routing flag. The flag flips to local the instant you touch the local
+    # keyboard (input reclaim); tying output to it would silently drop replies.
+    # The gate is the explicit "phone is connected" switch.
     for text in follow(cwd):
-        if not always and paths.read_flag() != "remote":
+        if not always and not paths.remote_enabled():
             continue
+        ok = True
         for piece in _chunk(text):
             try:
                 wechat_out.send_text(piece, user=user)
             except Exception as exc:  # keep the loop alive on transient errors
-                print(f"[mirror] send failed: {exc}", flush=True)
+                _log(f"[mirror] send failed: {exc}")
+                ok = False
                 break
+        if ok:
+            _log(f"[mirror] -> phone: {text[:50]!r}")
 
 
 def _inbound_drive(text: str) -> None:
@@ -58,30 +82,32 @@ def _inbound_drive(text: str) -> None:
     try:
         wrapper.inject(text, submit=True)
     except Exception as exc:
-        print(f"[inbound] inject failed: {exc}", flush=True)
+        _log(f"[inbound] inject failed: {exc}")
 
 
 def _wechat_inbound_loop() -> None:
     from . import config, wechat_in
 
     if not config.allowlist_active():
-        print(
+        _log(
             "[wechat_in] WARNING: no allowlist — ANY user who messages the bot can "
-            "drive Claude (full tool access). Set wechat.user_id / wechat.allowed_users.",
-            flush=True,
+            "drive Claude (full tool access). Set wechat.user_id / wechat.allowed_users."
         )
 
     async def on_message(text: str, user_id: str) -> None:
-        if not config.is_authorized(user_id):
-            print(f"[wechat_in] DROP unauthorized <{user_id}> {text[:40]}", flush=True)
+        if not paths.remote_enabled():
+            _log(f"[wechat_in] remote OFF, ignoring <{user_id}> {text[:40]}")
             return
-        print(f"[wechat_in] <{user_id}> {text[:60]}", flush=True)
+        if not config.is_authorized(user_id):
+            _log(f"[wechat_in] DROP unauthorized <{user_id}> {text[:40]}")
+            return
+        _log(f"[wechat_in] <{user_id}> {text[:60]}")
         _inbound_drive(text)
 
     try:
         asyncio.run(wechat_in.poll_forever(on_message))
     except Exception as exc:
-        print(f"[wechat_in] stopped: {exc}", flush=True)
+        _log(f"[wechat_in] stopped: {exc}")
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -141,6 +167,34 @@ class _Handler(BaseHTTPRequestHandler):
             self._reply(404, "not found")
 
 
+def start_background(
+    cwd: Path | None,
+    *,
+    host: str = "127.0.0.1",
+    port: int = 8765,
+    always: bool = False,
+    user: str | None = None,
+    wechat: bool = True,
+    log_path: Path | None = None,
+) -> ThreadingHTTPServer:
+    """Start mirror + WeChat poll + HTTP as daemon threads; return the httpd.
+
+    Used by both `mvibe bridge` (foreground) and `mvibe up` (in-process beside
+    the TUI). Pass log_path to keep logs off stdout when sharing the terminal.
+    """
+    global _LOG_PATH
+    if log_path is not None:
+        _LOG_PATH = log_path
+    paths.ensure_home()
+    threading.Thread(target=_mirror_loop, args=(cwd, always, user), daemon=True).start()
+    if wechat:
+        threading.Thread(target=_wechat_inbound_loop, daemon=True).start()
+    httpd = ThreadingHTTPServer((host, port), _Handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    _log(f"[bridge] http://{host}:{port}  cwd={cwd}  always={always}  wechat={wechat}")
+    return httpd
+
+
 def serve(
     cwd: Path | None,
     *,
@@ -150,18 +204,12 @@ def serve(
     user: str | None = None,
     wechat: bool = True,
 ) -> int:
-    paths.ensure_home()
-    threading.Thread(target=_mirror_loop, args=(cwd, always, user), daemon=True).start()
-    if wechat:
-        threading.Thread(target=_wechat_inbound_loop, daemon=True).start()
-
-    httpd = ThreadingHTTPServer((host, port), _Handler)
-    print(
-        f"[bridge] http://{host}:{port}  cwd={cwd}  always={always}  wechat={wechat}",
-        flush=True,
+    httpd = start_background(
+        cwd, host=host, port=port, always=always, user=user, wechat=wechat
     )
     try:
-        httpd.serve_forever()
+        while True:
+            threading.Event().wait(3600)
     except KeyboardInterrupt:
         pass
     finally:
