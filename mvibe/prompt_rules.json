@@ -1,0 +1,34 @@
+{
+  "_comment": "Confirmation-prompt detection keywords. All matching is case-insensitive. Edit this file (or drop an override at ~/.mvibe/prompt_rules.json) to tune which TUI screens count as a confirmation that gets forwarded to the phone.",
+
+  "min_options": 2,
+  "tail_lines": 16,
+
+  "confirm_phrases": [
+    "do you want to",
+    "would you like to",
+    "do you trust"
+  ],
+
+  "option_keywords": [
+    "ask again",
+    "tell claude"
+  ],
+
+  "yesno_option_prefixes": [
+    "yes",
+    "no"
+  ],
+
+  "yn_regex": "\\(\\s*[yY]\\s*/\\s*[nN]\\s*\\)|\\[\\s*[yY]\\s*/\\s*[nN]\\s*\\]",
+
+  "_extract_comment": "How to trim the forwarded confirmation text. Claude draws a horizontal rule before the confirm box; we forward only what follows it (falling back to a few lines above the question). Bottom hint lines are dropped.",
+  "separator_chars": "─━—-=_",
+  "separator_min_len": 10,
+  "context_lines_above": 3,
+  "drop_line_phrases": [
+    "esc to cancel",
+    "tab to amend",
+    "to explain"
+  ]
+}

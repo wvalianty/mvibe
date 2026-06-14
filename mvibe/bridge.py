@@ -43,23 +43,39 @@ def _chunk(text: str, size: int = _MAX_CHUNK):
         yield text[i : i + size]
 
 
-def _mirror_loop(cwd: Path | None, always: bool, user: str | None) -> None:
+_window_warned = False  # dedup the "push window closed" hint so it logs once
+
+
+def _safe_send(text: str, user: str | None = None) -> bool:
+    """Send to the phone, logging the window-closed hint only once until a send
+    succeeds again. Returns True on success."""
+    global _window_warned
     from . import wechat_out
 
+    try:
+        wechat_out.send_text(text, user=user)
+        if _window_warned:
+            _window_warned = False
+            _log("[wechat] push window reopened — sends working again")
+        return True
+    except wechat_out.WindowClosedError as exc:
+        if not _window_warned:
+            _window_warned = True
+            _log(f"[wechat] {exc}")
+        return False
+    except Exception as exc:
+        _log(f"[wechat] send failed: {exc}")
+        return False
+
+
+def _mirror_loop(cwd: Path | None, always: bool, user: str | None) -> None:
     # Output mirroring follows the remote *gate* (the /mvibe-on/off switch), NOT
     # the routing flag. The flag flips to local the instant you touch the local
     # keyboard (input reclaim); tying output to it would silently drop replies.
     for text in follow(cwd):
         if not always and not paths.remote_enabled():
             continue
-        ok = True
-        for piece in _chunk(text):
-            try:
-                wechat_out.send_text(piece, user=user)
-            except Exception as exc:  # keep the loop alive on transient errors
-                _log(f"[mirror] send failed: {exc}")
-                ok = False
-                break
+        ok = all(_safe_send(piece, user) for piece in _chunk(text))
         if ok:
             _log(f"[mirror] -> phone: {text[:50]!r}")
 
@@ -94,17 +110,20 @@ def on_prompt_change(prompt) -> None:
     # The phone can answer, and the local TUI can still answer too.
     if not paths.remote_enabled():
         return
-    from . import wechat_out
-
     with _pending_lock:
+        # One outstanding confirmation at a time: re-renders of the same prompt
+        # (cursor blink, spinner) arrive as fresh detections — skip them. Cleared
+        # when the screen stops being a prompt (on_change(None)).
+        if _pending is not None:
+            return
         _pending = {"options": prompt.options, "kind": prompt.kind}
     hint = "回复 yes / no" if prompt.kind == "yn" else "回复选项数字，或 yes / no"
     msg = f"⚠️ 需要确认：\n\n{prompt.text}\n\n（{hint}）"
-    try:
-        wechat_out.send_text(msg)
+    if _safe_send(msg):
         _log(f"[approve] forwarded prompt ({prompt.kind}, {len(prompt.options)} opts)")
-    except Exception as exc:
-        _log(f"[approve] forward failed: {exc}")
+    else:
+        with _pending_lock:
+            _pending = None  # send failed; allow a retry on the next render
 
 
 def _map_reply(text: str, pending: dict) -> str | None:
@@ -144,12 +163,7 @@ def _try_answer_pending(text: str) -> bool:
         return False
     key = _map_reply(text, pending)
     if key is None:
-        from . import wechat_out
-
-        try:
-            wechat_out.send_text("没听懂，请回复选项数字或 yes / no")
-        except Exception:
-            pass
+        _safe_send("没听懂，请回复选项数字或 yes / no")
         return True  # swallow: don't inject a stray message into the prompt
     paths.write_flag("remote")
     try:

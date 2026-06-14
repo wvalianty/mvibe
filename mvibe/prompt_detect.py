@@ -13,23 +13,51 @@ from __future__ import annotations
 
 import codecs
 import hashlib
+import json
 import re
 import threading
 import time
+from pathlib import Path
 
 import pyte
 
 # A numbered option line, e.g. "❯ 1. Yes" / "│ 2. No ... │" (leading box/cursor
 # chars allowed; trailing box chars stripped from the captured label).
 _OPT_RE = re.compile(r"^[\s>❯▶►●○*\-│┃|]*([0-9])[.)]\s+(\S.*?)[\s│┃|]*$")
-# Selection cursors a TUI uses to mark the active choice.
-_CURSORS = ("❯", "▶", "►", "➤", "●")
-# y/n style prompt.
-_YN_RE = re.compile(r"\(\s*[yY]\s*/\s*[nN]\s*\)|\[\s*[yY]\s*/\s*[nN]\s*\]")
-# Phrases that strongly imply a waiting confirmation (lower-cased match).
-_HINTS = ("do you want", "proceed", "permission", "allow", "trust", "(y/n)")
 
-_BOX = "│┃┆┇╎╏┊┋ ╭╮╰╯─━┌┐└┘├┤ "
+_BOX = "│┃┆┇╎╏┊┋ ╭╮╰╯─━┌┐└┘├┤ ❯▶►➤●○"
+
+# Detection keywords live in config so they can be tuned without touching logic.
+_RULES_FILE = Path(__file__).with_name("prompt_rules.json")  # shipped defaults
+_RULES_OVERRIDE = Path.home() / ".mvibe" / "prompt_rules.json"  # optional user override
+_rules_cache: dict | None = None
+
+
+def _load_rules() -> dict:
+    global _rules_cache
+    if _rules_cache is not None:
+        return _rules_cache
+    rules: dict = {}
+    for path in (_RULES_FILE, _RULES_OVERRIDE):
+        try:
+            rules.update(json.loads(path.read_text(encoding="utf-8")))
+        except (FileNotFoundError, json.JSONDecodeError):
+            continue
+    # Pre-lower keyword lists for case-insensitive matching.
+    rules["confirm_phrases"] = [s.lower() for s in rules.get("confirm_phrases", [])]
+    rules["option_keywords"] = [s.lower() for s in rules.get("option_keywords", [])]
+    rules["yesno_option_prefixes"] = tuple(
+        s.lower() for s in rules.get("yesno_option_prefixes", [])
+    )
+    rules["drop_line_phrases"] = [s.lower() for s in rules.get("drop_line_phrases", [])]
+    rules.setdefault("min_options", 2)
+    rules.setdefault("tail_lines", 16)
+    rules.setdefault("separator_chars", "─━—-=_")
+    rules.setdefault("separator_min_len", 10)
+    rules.setdefault("context_lines_above", 6)
+    rules["_yn"] = re.compile(rules["yn_regex"]) if rules.get("yn_regex") else None
+    _rules_cache = rules
+    return rules
 
 
 class Prompt:
@@ -46,12 +74,56 @@ def _strip_box(line: str) -> str:
     return line.strip(_BOX).rstrip()
 
 
+def _is_separator(line: str, rules: dict) -> bool:
+    s = line.strip()
+    if len(s) < rules["separator_min_len"]:
+        return False
+    sep = set(rules["separator_chars"])
+    return all(c in sep or c == " " for c in s)
+
+
+def _extract_box(tail: list[str], rules: dict) -> str:
+    """Trim the rendered tail to just the confirmation box: everything after the
+    last horizontal rule (Claude draws one before the box), or — if there is no
+    rule — from a few lines above the confirm question. Box chars and bottom hint
+    lines are dropped."""
+    sep_idx = -1
+    for i, ln in enumerate(tail):
+        if _is_separator(ln, rules):
+            sep_idx = i
+    if sep_idx >= 0:
+        block = tail[sep_idx + 1 :]
+    else:
+        qi = next(
+            (i for i, ln in enumerate(tail)
+             if any(p in ln.lower() for p in rules["confirm_phrases"])),
+            None,
+        )
+        block = tail[max(0, qi - rules["context_lines_above"]) :] if qi is not None else tail
+
+    drops = rules["drop_line_phrases"]
+    out: list[str] = []
+    for ln in block:
+        s = _strip_box(ln)
+        if not s:
+            continue
+        low = s.lower()
+        if any(d in low for d in drops):
+            continue
+        out.append(s)
+    return "\n".join(out)
+
+
 def detect(lines: list[str]) -> Prompt | None:
-    """Return a Prompt if the rendered screen looks like it is awaiting a choice."""
+    """Return a Prompt if the rendered screen looks like a confirmation awaiting a
+    choice. Discriminates real confirmations from ordinary numbered menus (slash
+    commands, autocomplete, model picker) using the keyword config — those menus
+    lack a confirm phrase and Yes/No-style options. Case-insensitive."""
+    rules = _load_rules()
     nonempty = [ln for ln in lines if ln.strip()]
     if not nonempty:
         return None
-    tail = nonempty[-16:]
+    tail = nonempty[-rules["tail_lines"] :]
     joined = " ".join(tail)
     low = joined.lower()
 
@@ -61,17 +133,20 @@ def detect(lines: list[str]) -> Prompt | None:
         if m:
             options.append((m.group(1), m.group(2).strip()))
 
-    text = "\n".join(_strip_box(ln) for ln in tail if _strip_box(ln))
+    text = _extract_box(tail, rules)
 
-    has_cursor = any(c in joined for c in _CURSORS)
-    has_hint = any(h in low for h in _HINTS)
-
-    # Numbered prompt: at least two options AND a cursor or hint (so we don't
-    # fire on an ordinary numbered list inside the assistant's normal output).
-    if len(options) >= 2 and (has_cursor or has_hint):
-        return Prompt(text, options, "numbered")
-    # y/n prompt.
-    if _YN_RE.search(joined) or "(y/n)" in low:
+    if len(options) >= rules["min_options"]:
+        has_phrase = any(p in low for p in rules["confirm_phrases"])
+        kws = rules["option_keywords"]
+        prefixes = rules["yesno_option_prefixes"]
+        opt_signal = any(
+            any(k in label.lower() for k in kws)
+            or (prefixes and label.lower().startswith(prefixes))
+            for _, label in options
+        )
+        if has_phrase or opt_signal:
+            return Prompt(text, options, "numbered")
+    if rules["_yn"] is not None and rules["_yn"].search(joined):
         return Prompt(text, [], "yn")
     return None
 
@@ -129,7 +204,14 @@ class PromptWatcher:
             chars = []
             for x in range(screen.columns):
                 cell = row.get(x)
-                chars.append(cell.data if cell is not None and cell.data else " ")
+                if cell is None:
+                    chars.append(" ")
+                elif cell.data == "":
+                    # Wide-char continuation cell (the second half of a CJK/emoji
+                    # glyph). pyte stores "" here — skip it, don't pad a space.
+                    continue
+                else:
+                    chars.append(cell.data)
             out.append("".join(chars).rstrip())
         return out
 

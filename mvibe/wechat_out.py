@@ -1,8 +1,9 @@
-"""Send text to the WeChat phone client via avibe's iLink send_message.
+"""Send text to the WeChat phone client via the vendored iLink send_message.
 
-Uses mvibe's own bot_token/context_tokens (falling back to an existing avibe
-install). iLink only allows pushing within a window after the phone last
-messaged the bot; after a long idle gap a send can fail with errcode -14.
+iLink only allows pushing within a window after the phone last messaged the bot.
+Once that window closes, send_message fails — observed as ret/errcode -14 (token
+expired) or -2 (window closed). Both mean the same fix: message the bot from the
+phone to reopen the window.
 """
 
 from __future__ import annotations
@@ -12,11 +13,16 @@ import asyncio
 from . import _tls, config
 from .ilink import wechat_api
 
-SESSION_EXPIRED_ERRCODE = -14
+# Codes that mean "the push window is closed; the phone must message the bot".
+WINDOW_CLOSED_CODES = {"-14", "-2"}
 
 
 class WeChatError(RuntimeError):
     pass
+
+
+class WindowClosedError(WeChatError):
+    """Push failed because the phone hasn't messaged the bot recently."""
 
 
 async def _send(base_url, bot_token, user_id, context_token, text) -> dict:
@@ -51,6 +57,9 @@ def send_text(text: str, user: str | None = None) -> str:
     code = errcode if errcode not in (None, 0) else ret
     if code in (None, 0):
         return user_id
-    if str(code) == str(SESSION_EXPIRED_ERRCODE):
-        raise WeChatError(f"session expired (code={code}); phone must message bot to refresh")
+    if str(code) in WINDOW_CLOSED_CODES:
+        raise WindowClosedError(
+            f"push window closed (code={code}) — send any message to the bot "
+            "from your phone to reopen it, then retry"
+        )
     raise WeChatError(f"wechat error code={code} msg={resp.get('errmsg') or resp.get('msg')}")
