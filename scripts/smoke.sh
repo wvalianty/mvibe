@@ -43,32 +43,16 @@ run send --remote "$(printf 'x\x1b[31mY')"
 sleep 0.5
 check "ESC stripped" "ECHO: X[31MY" "$OUT"
 
-echo "== 4. HTTP inbound (--no-wechat) =="
-run bridge --cwd . --no-wechat --port 8765 >/tmp/mvibe_bridge.log 2>&1 &
-BPID=$!
-sleep 1.5
-curl -s localhost:8765/status | grep -q flag && echo "  PASS: /status" && PASS=$((PASS+1)) || { echo "  FAIL: /status"; FAIL=$((FAIL+1)); }
-curl -s -X POST --data 'via http' localhost:8765/inbound >/dev/null
-sleep 0.5
-check "HTTP /inbound injected" "ECHO: VIA HTTP" "$OUT"
-kill $BPID 2>/dev/null
+echo "== 4. send via remote flag, gate toggles =="
+run remote off >/dev/null; run remote status | grep -q "remote: off" && echo "  PASS: gate off" && PASS=$((PASS+1)) || { echo "  FAIL: gate off"; FAIL=$((FAIL+1)); }
+run remote on >/dev/null; run remote status | grep -q "remote: on" && echo "  PASS: gate on" && PASS=$((PASS+1)) || { echo "  FAIL: gate on"; FAIL=$((FAIL+1)); }
 
-echo "== 5. HTTP token gate =="
-MVIBE_HTTP_TOKEN=secret run bridge --cwd . --no-wechat --port 8766 >/tmp/mvibe_bridge2.log 2>&1 &
-BPID2=$!
-sleep 1.5
-code_noauth=$(curl -s -o /dev/null -w '%{http_code}' -X POST --data hi localhost:8766/inbound)
-code_auth=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'X-MVIBE-Token: secret' --data hi localhost:8766/inbound)
-[ "$code_noauth" = "401" ] && echo "  PASS: no-token -> 401" && PASS=$((PASS+1)) || { echo "  FAIL: no-token -> $code_noauth"; FAIL=$((FAIL+1)); }
-[ "$code_auth" = "200" ] && echo "  PASS: token -> 200" && PASS=$((PASS+1)) || { echo "  FAIL: token -> $code_auth"; FAIL=$((FAIL+1)); }
-kill $BPID2 2>/dev/null
-
-echo "== 6. file perms (0600/0700) =="
+echo "== 5. file perms (0600/0700) =="
 run flag remote >/dev/null
 perm_dir=$(stat -f '%Lp' "$MVIBE_HOME" 2>/dev/null || stat -c '%a' "$MVIBE_HOME")
 [ "$perm_dir" = "700" ] && echo "  PASS: home 0700" && PASS=$((PASS+1)) || { echo "  FAIL: home $perm_dir"; FAIL=$((FAIL+1)); }
 
-echo "== 7. tailer parses real transcript =="
+echo "== 6. tailer parses real transcript =="
 n=$(uv run --quiet python -c "
 from mvibe.tailer import _extract_assistant_text
 import json,glob,os
@@ -81,10 +65,9 @@ print(sum(1 for l in open(f) if l.strip() and _extract_assistant_text(json.loads
 
 echo "== cleanup =="
 # `uv run` spawns a grandchild python; kill by pattern so nothing leaks the port.
-pkill -f "mvibe bridge --cwd . --no-wechat" 2>/dev/null
 pkill -f 'print("ECHO:"' 2>/dev/null
 kill $WPID 2>/dev/null; pkill -P $WPID 2>/dev/null
-rm -rf "$MVIBE_HOME" "$OUT" /tmp/mvibe_bridge.log /tmp/mvibe_bridge2.log
+rm -rf "$MVIBE_HOME" "$OUT"
 
 echo
 echo "RESULT: $PASS passed, $FAIL failed"

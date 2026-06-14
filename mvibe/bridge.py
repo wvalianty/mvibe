@@ -1,36 +1,25 @@
 """Remote bridge: mirror Claude's output to WeChat and inject WeChat input back.
 
-Two halves, both decoupled from the PTY wrapper via the flag file + inject FIFO:
+Both halves are decoupled from the PTY wrapper via the flag file + inject FIFO:
 
   output: tail the session transcript -> push assistant text to the phone
-          (only while flag == remote, unless --always)
-  input:  a tiny HTTP receiver. Anything that can POST text drives the session:
-            POST /inbound        body = message text -> inject + flag=remote
-            POST /flag/local     -> hand control back to the local terminal
-            POST /flag/remote    -> take over from remote
-            GET  /status         -> {"flag": ...}
+          (while the remote gate is on)
+  input:  long-poll WeChat for messages -> inject them as keystrokes
 
-Wiring an actual WeChat inbound source to POST /inbound is intentionally left as
-a thin adapter (avibe already owns the bot's inbound webhook); for local testing
-use `mvibe send` or curl.
+No network listener: WeChat inbound is an outbound long-poll, and local control
+goes through the CLI (`mvibe send` / `flag` / `remote`) + files directly.
 """
 
 from __future__ import annotations
 
 import asyncio
-import hmac
-import os
 import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from . import paths, wrapper
 from .tailer import follow
 
 _MAX_CHUNK = 1800
-_MAX_BODY = 64 * 1024  # cap inbound POST bodies (DoS guard)
-# Optional shared secret; when set, /inbound and /flag/* require X-MVIBE-Token.
-_HTTP_TOKEN = os.environ.get("MVIBE_HTTP_TOKEN", "")
 
 # When the bridge runs inside `mvibe up` (same terminal as the claude TUI), its
 # logs must NOT hit stdout or they corrupt the full-screen TUI. _LOG_PATH
@@ -60,7 +49,6 @@ def _mirror_loop(cwd: Path | None, always: bool, user: str | None) -> None:
     # Output mirroring follows the remote *gate* (the /mvibe-on/off switch), NOT
     # the routing flag. The flag flips to local the instant you touch the local
     # keyboard (input reclaim); tying output to it would silently drop replies.
-    # The gate is the explicit "phone is connected" switch.
     for text in follow(cwd):
         if not always and not paths.remote_enabled():
             continue
@@ -85,6 +73,95 @@ def _inbound_drive(text: str) -> None:
         _log(f"[inbound] inject failed: {exc}")
 
 
+# ---- interactive confirmation forwarding (screen-scraped) ------------------ #
+_pending: dict | None = None  # {"options": [(digit,label)], "kind": "numbered"|"yn"}
+_pending_lock = threading.Lock()
+
+_YES_WORDS = {"y", "yes", "是", "确认", "ok", "好", "同意", "允许"}
+_NO_WORDS = {"n", "no", "否", "取消", "不", "拒绝"}
+
+
+def on_prompt_change(prompt) -> None:
+    """Called by the wrapper's screen watcher. Forward a new confirmation to the
+    phone (only while remote-driving), or clear pending when it disappears."""
+    global _pending
+    if prompt is None:
+        with _pending_lock:
+            _pending = None
+        return
+    # Forward whenever the remote gate is on — same rule as output mirroring, NOT
+    # the routing flag (which flips to local the moment you touch the keyboard).
+    # The phone can answer, and the local TUI can still answer too.
+    if not paths.remote_enabled():
+        return
+    from . import wechat_out
+
+    with _pending_lock:
+        _pending = {"options": prompt.options, "kind": prompt.kind}
+    hint = "回复 yes / no" if prompt.kind == "yn" else "回复选项数字，或 yes / no"
+    msg = f"⚠️ 需要确认：\n\n{prompt.text}\n\n（{hint}）"
+    try:
+        wechat_out.send_text(msg)
+        _log(f"[approve] forwarded prompt ({prompt.kind}, {len(prompt.options)} opts)")
+    except Exception as exc:
+        _log(f"[approve] forward failed: {exc}")
+
+
+def _map_reply(text: str, pending: dict) -> str | None:
+    """Map a phone reply to the keystroke that answers the prompt, or None."""
+    t = text.strip().lower()
+    if pending["kind"] == "yn":
+        if t in _YES_WORDS:
+            return "y"
+        if t in _NO_WORDS:
+            return "n"
+        return None
+    options = pending["options"]  # [(digit, label)]
+    digits = {d for d, _ in options}
+    if t in digits:
+        return t
+    if t in _YES_WORDS:
+        for d, label in options:
+            if "yes" in label.lower():
+                return d
+        return options[0][0] if options else None
+    if t in _NO_WORDS:
+        for d, label in options:
+            ll = label.lower()
+            if "no" in ll or "cancel" in ll or "reject" in ll:
+                return d
+        return options[-1][0] if options else None
+    return None
+
+
+def _try_answer_pending(text: str) -> bool:
+    """If a confirmation is pending, treat `text` as the answer. Returns True if
+    handled (so it is not injected as an ordinary message)."""
+    global _pending
+    with _pending_lock:
+        pending = _pending
+    if pending is None:
+        return False
+    key = _map_reply(text, pending)
+    if key is None:
+        from . import wechat_out
+
+        try:
+            wechat_out.send_text("没听懂，请回复选项数字或 yes / no")
+        except Exception:
+            pass
+        return True  # swallow: don't inject a stray message into the prompt
+    paths.write_flag("remote")
+    try:
+        wrapper.inject(key, submit=False)  # a single key selects; no Enter
+    except Exception as exc:
+        _log(f"[approve] reply inject failed: {exc}")
+    with _pending_lock:
+        _pending = None
+    _log(f"[approve] reply {text!r} -> key {key!r}")
+    return True
+
+
 def _wechat_inbound_loop() -> None:
     from . import config, wechat_in
 
@@ -101,6 +178,8 @@ def _wechat_inbound_loop() -> None:
         if not config.is_authorized(user_id):
             _log(f"[wechat_in] DROP unauthorized <{user_id}> {text[:40]}")
             return
+        if _try_answer_pending(text):  # a pending confirmation consumes this reply
+            return
         _log(f"[wechat_in] <{user_id}> {text[:60]}")
         _inbound_drive(text)
 
@@ -110,74 +189,15 @@ def _wechat_inbound_loop() -> None:
         _log(f"[wechat_in] stopped: {exc}")
 
 
-class _Handler(BaseHTTPRequestHandler):
-    def log_message(self, *_):  # silence default logging
-        pass
-
-    def _reply(self, code: int, body: str = "ok") -> None:
-        payload = body.encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.send_header("Content-Length", str(len(payload)))
-        self.end_headers()
-        self.wfile.write(payload)
-
-    def do_GET(self):
-        if self.path == "/status":
-            self._reply(200, f'{{"flag": "{paths.read_flag()}"}}')
-        else:
-            self._reply(404, "not found")
-
-    def _authed(self) -> bool:
-        if not _HTTP_TOKEN:
-            return True
-        return hmac.compare_digest(self.headers.get("X-MVIBE-Token", ""), _HTTP_TOKEN)
-
-    def do_POST(self):
-        if not self._authed():
-            self._reply(401, "unauthorized")
-            return
-        try:
-            length = int(self.headers.get("Content-Length") or 0)
-        except ValueError:
-            self._reply(400, "bad length")
-            return
-        if length > _MAX_BODY:
-            self._reply(413, "too large")
-            return
-        body = self.rfile.read(length).decode("utf-8", errors="replace") if length else ""
-        if self.path == "/inbound":
-            text = body.strip()
-            if not text:
-                self._reply(400, "empty")
-                return
-            try:
-                _inbound_drive(text)
-            except Exception as exc:
-                self._reply(503, f"inject failed: {exc}")
-                return
-            self._reply(200, "injected")
-        elif self.path == "/flag/local":
-            paths.write_flag("local")
-            self._reply(200, "local")
-        elif self.path == "/flag/remote":
-            paths.write_flag("remote")
-            self._reply(200, "remote")
-        else:
-            self._reply(404, "not found")
-
-
 def start_background(
     cwd: Path | None,
     *,
-    host: str = "127.0.0.1",
-    port: int = 8765,
     always: bool = False,
     user: str | None = None,
     wechat: bool = True,
     log_path: Path | None = None,
-) -> ThreadingHTTPServer:
-    """Start mirror + WeChat poll + HTTP as daemon threads; return the httpd.
+) -> None:
+    """Start mirror + WeChat poll as daemon threads.
 
     Used by both `mvibe bridge` (foreground) and `mvibe up` (in-process beside
     the TUI). Pass log_path to keep logs off stdout when sharing the terminal.
@@ -189,29 +209,20 @@ def start_background(
     threading.Thread(target=_mirror_loop, args=(cwd, always, user), daemon=True).start()
     if wechat:
         threading.Thread(target=_wechat_inbound_loop, daemon=True).start()
-    httpd = ThreadingHTTPServer((host, port), _Handler)
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    _log(f"[bridge] http://{host}:{port}  cwd={cwd}  always={always}  wechat={wechat}")
-    return httpd
+    _log(f"[bridge] cwd={cwd}  always={always}  wechat={wechat}")
 
 
 def serve(
     cwd: Path | None,
     *,
-    host: str = "127.0.0.1",
-    port: int = 8765,
     always: bool = False,
     user: str | None = None,
     wechat: bool = True,
 ) -> int:
-    httpd = start_background(
-        cwd, host=host, port=port, always=always, user=user, wechat=wechat
-    )
+    start_background(cwd, always=always, user=user, wechat=wechat)
     try:
         while True:
             threading.Event().wait(3600)
     except KeyboardInterrupt:
         pass
-    finally:
-        httpd.shutdown()
     return 0

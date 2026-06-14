@@ -13,9 +13,9 @@
             │ inject FIFO → PTY（remote 路由时）                │     （单进程）
             └───────────────────────────────────────────────────┘        │ 写入
                                                           .jsonl ◄─────────┘
- 微信 ──入站──► inject FIFO + flag=remote                        │
-     ◄── 推送(iLink) ── tail transcript .jsonl（assistant text）◄─┘
-                       [mvibe bridge]（出站受 remote gate 控制）
+ 微信 ──long-poll 入站──► inject FIFO + flag=remote               │
+     ◄── 推送(iLink) ──── tail transcript .jsonl（assistant text）◄┘
+                       [mvibe bridge]（出站受 remote gate 控制，无网络监听）
 ```
 
 - **本地保持真 TUI**（富渲染、slash 命令、plan mode）：PTY 透明透传，即
@@ -57,6 +57,17 @@ mvibe                 # = mvibe up，cwd 即当前目录
 
 等价写法：`mvibe up`（同上）、`mvibe up --cwd /other/dir`（指定目录）。
 
+**传 claude 参数**：`--` 前是 mvibe 参数，后是 claude 参数（整条当命令运行）：
+
+```bash
+mvibe -- claude --resume 873fd8af-...      # 续接指定会话
+mvibe -- claude -c                          # 续接最近会话
+mvibe up --cwd /proj -- claude --model opus
+```
+
+`--` 后写程序名即可换后端（如 `mvibe -- codex ...`）。注意：显式 `-- <cmd>` 时
+mvibe 不再自动加 claude 默认参数（`--yolo` 等被忽略，全由你控制）。
+
 手机端：先给 bot 发一条消息建立会话，之后你发的内容驱动这个 Claude TUI，
 Claude 的回复以聊天消息返回。退出 claude（`/exit`）即整体结束。
 
@@ -83,14 +94,15 @@ mvibe run --cwd .       # 终端1：claude TUI（必须先起）
 mvibe bridge --cwd .    # 终端2：镜像 + 入站
 ```
 
-### 直接命令 / HTTP
+### 直接命令
 
 ```bash
 mvibe remote on|off|status      # 远程接管开关
 mvibe flag remote|local         # 仅切路由
-mvibe send "继续"                # 注入一行
-curl -X POST --data '继续' localhost:8765/inbound   # HTTP 驱动（无需微信）
+mvibe send "继续"                # 注入一行到当前会话
 ```
+
+无网络监听：微信入站是 long-poll（出站连接），本地控制全走 CLI + 文件。
 
 ## 微信：独立 bot
 
@@ -119,14 +131,36 @@ iLink 协议代码 vendored 在 `mvibe/ilink/`（`wechat_api.py` / `wechat_auth.
 - **入站鉴权（默认安全）**：`mvibe login` 会写入 `wechat.user_id`，此后只有该
   用户能驱动会话；其余被丢弃。多人放行用 `wechat.allowed_users: [...]`。若两者
   皆空，则放行所有人并打印告警——别在这种状态下长期运行。
-- **HTTP `/inbound` 鉴权**：默认仅绑 `127.0.0.1`。需要时设 `MVIBE_HTTP_TOKEN`
-  环境变量，请求须带 `X-MVIBE-Token` 头匹配。body 上限 64KB。
+- **无网络监听**：不开任何端口，没有可被本机其他进程访问的注入入口；入站只来自
+  已鉴权的微信 bot。
 - **凭证文件权限**：`~/.mvibe` 为 `0700`，`config.json` / `context_tokens` /
   `sync_buf` 为 `0600`（仅本人可读）。
 - **注入消毒**：远程文本注入 PTY 前剥除 C0 控制符（含 ESC），防终端转义/控制键
   注入；制表与换行保留。
 - **TLS**：若存在 `~/tmp/cacert.pem`，会经 `SSL_CERT_FILE` 启用该 CA bundle
   （Cloudflare WARP 拦截环境所需）——这会扩大信任根，按需保留。
+
+## 交互确认转发（抓屏）
+
+claude 的确认框（「是否允许 Web Search？1/2/3」「(y/n)」）是 **TUI 界面元素**，不进
+transcript。mvibe 用**抓屏**把它转发到手机：
+
+- `mvibe up` 用 pyte 终端模拟器维护「渲染后的屏幕」，喂入 PTY 输出（`prompt_detect.py`）。
+- 屏幕稳定（停 ~300ms）且匹配「确认框形态」（编号选项 + 光标 ❯，或 `(y/n)`）时，
+  把框文本发手机：`⚠️ 需要确认：… 回复数字 或 yes/no`。
+- 手机回 `1`/`2`/`yes`/`no` → 映射成按键注入 TUI（`yes`→含 "Yes" 那项，`no`→"No"/取消）。
+- **remote gate 开启时就转发**（与出站镜像同规则，不看 flag）；手机或本地终端都能答。
+  久不回则框留着。不想被转发就 `/mvibe-off`。
+
+**后端无关**：机制（pyte 渲染 + 按键注入）跟谁是后端无关；只有「确认框形态」识别规则
+按后端配（现内置 claude 形态）。换 codex 等只需在 `prompt_detect.py` 加一条规则。
+
+限制 & 选项：
+
+- 仅 `mvibe up`（单进程）生效——PTY 字节只有 wrapper 进程有；两终端 `bridge` 看不到。
+- 完全不想要确认（自动跑）：`mvibe up --yolo`（给 claude 加 `--dangerously-skip-permissions`）。
+- 检测靠 UI 形态匹配，claude 改版可能要调 `prompt_detect.py` 的规则。
+- 远程能让 claude 跑任何工具——**靠入站 allowlist 限制是谁**（见安全）。
 
 ## 注意事项
 
@@ -141,8 +175,9 @@ iLink 协议代码 vendored 在 `mvibe/ilink/`（`wechat_api.py` / `wechat_auth.
 mvibe/
   cli.py          命令行（argparse）：默认/up/run/bridge/login/remote/send/flag/status
   wrapper.py      PTY mux 核心：本地透传 + flag 路由 + 本地按键夺回 + 注入消毒
-  bridge.py       后台：transcript→微信镜像 + 微信入站 poll + HTTP 接收
+  bridge.py       后台：transcript→微信镜像 + 微信入站 poll（无网络监听）
   tailer.py       follow transcript .jsonl，抽 assistant text
+  prompt_detect.py pyte 抓屏：检测确认框 → 回调（确认转发用）
   wechat_in.py    iLink getUpdates 长轮询入站
   wechat_out.py   iLink send_message 出站
   wechat_login.py QR 扫码绑定

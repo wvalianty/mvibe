@@ -3,7 +3,7 @@
   mvibe                             == `mvibe up` in the current directory
   mvibe up [-- claude args...]      claude TUI + bridge (background) in one terminal
   mvibe run [-- claude args...]     launch the wrapped Claude TUI (local-identical)
-  mvibe bridge [--cwd DIR] [...]    run the remote mirror + inbound HTTP receiver
+  mvibe bridge [--cwd DIR] [...]    run the remote mirror + WeChat inbound poll
   mvibe login                       bind a WeChat bot via QR
   mvibe remote on|off|status        enable/disable remote takeover
   mvibe send "text"                 inject keystrokes into the live session
@@ -20,12 +20,22 @@ from pathlib import Path
 from . import paths, wrapper
 
 
+def _claude_cmd(yolo: bool) -> list[str]:
+    """Default claude launch. Confirmation prompts are forwarded to the phone
+    (screen-scraped), so we keep them ON by default. `--yolo` bypasses them
+    entirely. Explicit `-- <cmd>` overrides this."""
+    cmd = ["claude"]
+    if yolo:
+        cmd.append("--dangerously-skip-permissions")
+    return cmd
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
     import os
 
     if args.cwd:
         os.chdir(args.cwd)  # claude's session dir is keyed by cwd; match the bridge
-    cmd = args.cmd or ["claude"]
+    cmd = args.cmd or _claude_cmd(args.yolo)
     return wrapper.run(cmd)
 
 
@@ -33,14 +43,7 @@ def _cmd_bridge(args: argparse.Namespace) -> int:
     from . import bridge
 
     cwd = Path(args.cwd).resolve() if args.cwd else Path.cwd()
-    return bridge.serve(
-        cwd,
-        host=args.host,
-        port=args.port,
-        always=args.always,
-        user=args.user,
-        wechat=not args.no_wechat,
-    )
+    return bridge.serve(cwd, always=args.always, user=args.user, wechat=not args.no_wechat)
 
 
 def _cmd_login(_args: argparse.Namespace) -> int:
@@ -65,16 +68,14 @@ def _cmd_up(args: argparse.Namespace) -> int:
     def on_ready() -> None:
         bridge.start_background(
             cwd,
-            host=args.host,
-            port=args.port,
             always=args.always,
             user=args.user,
             wechat=not args.no_wechat,
             log_path=log_path,  # keep bridge logs off the TUI screen
         )
 
-    cmd = args.cmd or ["claude"]
-    return wrapper.run(cmd, on_ready=on_ready)
+    cmd = args.cmd or _claude_cmd(args.yolo)
+    return wrapper.run(cmd, on_ready=on_ready, on_prompt=bridge.on_prompt_change)
 
 
 def _cmd_remote(args: argparse.Namespace) -> int:
@@ -118,25 +119,31 @@ def _cmd_status(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    if argv is None:
+        argv = sys.argv[1:]
+    # `mvibe -- <claude args>` (no subcommand) is shorthand for `mvibe up -- ...`.
+    if argv and argv[0] == "--":
+        argv = ["up", *argv]
+
     parser = argparse.ArgumentParser(prog="mvibe", description=__doc__)
     # Subcommand optional: bare `mvibe` == `mvibe up` in the current directory.
     sub = parser.add_subparsers(dest="command")
 
     p_run = sub.add_parser("run", help="launch the wrapped Claude TUI")
     p_run.add_argument("--cwd", help="chdir here before launching (match the bridge's --cwd)")
+    p_run.add_argument("--yolo", action="store_true",
+                       help="bypass claude's permission prompts (--dangerously-skip-permissions)")
     p_run.add_argument("cmd", nargs=argparse.REMAINDER,
                        help="command to run (default: claude); prefix with --")
     p_run.set_defaults(func=_cmd_run)
 
-    p_bridge = sub.add_parser("bridge", help="remote mirror + inbound receiver")
+    p_bridge = sub.add_parser("bridge", help="remote mirror + WeChat inbound poll")
     p_bridge.add_argument("--cwd", help="session cwd to mirror (default: current)")
-    p_bridge.add_argument("--host", default="127.0.0.1")
-    p_bridge.add_argument("--port", type=int, default=8765)
     p_bridge.add_argument("--always", action="store_true",
-                          help="push output even in local mode")
+                          help="push output even when remote gate is off")
     p_bridge.add_argument("--user", help="target WeChat user_id (default: most recent)")
     p_bridge.add_argument("--no-wechat", action="store_true",
-                          help="disable the WeChat inbound poll loop (HTTP only)")
+                          help="disable the WeChat inbound poll loop")
     p_bridge.set_defaults(func=_cmd_bridge)
 
     p_login = sub.add_parser("login", help="bind a WeChat bot via QR (writes mvibe config)")
@@ -144,13 +151,13 @@ def main(argv: list[str] | None = None) -> int:
 
     p_up = sub.add_parser("up", help="one terminal: claude TUI + bridge (background)")
     p_up.add_argument("--cwd", help="chdir here before launching")
-    p_up.add_argument("--host", default="127.0.0.1")
-    p_up.add_argument("--port", type=int, default=8765)
     p_up.add_argument("--always", action="store_true")
     p_up.add_argument("--user", help="target WeChat user_id (default: most recent)")
     p_up.add_argument("--no-wechat", action="store_true")
     p_up.add_argument("--no-remote", action="store_true",
                       help="start with remote takeover disabled (toggle later with /mvibe-on)")
+    p_up.add_argument("--yolo", action="store_true",
+                      help="bypass claude's permission prompts (--dangerously-skip-permissions)")
     p_up.add_argument("cmd", nargs=argparse.REMAINDER,
                       help="command to run (default: claude); prefix with --")
     p_up.set_defaults(func=_cmd_up)
@@ -177,8 +184,8 @@ def main(argv: list[str] | None = None) -> int:
     if getattr(args, "command", None) is None:
         # bare `mvibe` -> launch claude + bridge in the current directory
         return _cmd_up(argparse.Namespace(
-            cwd=None, host="127.0.0.1", port=8765,
-            always=False, user=None, no_wechat=False, no_remote=False, cmd=[],
+            cwd=None, always=False, user=None,
+            no_wechat=False, no_remote=False, yolo=False, cmd=[],
         ))
     # REMAINDER keeps a leading "--"; strip it so `mvibe run -- claude` works.
     if getattr(args, "cmd", None) and args.cmd and args.cmd[0] == "--":

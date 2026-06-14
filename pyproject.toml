@@ -5,6 +5,7 @@ description = "Mirror a local Claude Code TUI to a remote chat (WeChat). Local s
 requires-python = ">=3.11"
 dependencies = [
     "aiohttp>=3.9",
+    "pyte>=0.8.2",
     "segno>=1.6",
 ]
 

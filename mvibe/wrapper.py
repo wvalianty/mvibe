@@ -32,6 +32,16 @@ from . import paths
 _BUF = 65536
 
 
+def _winsize() -> tuple[int, int]:
+    """Return (cols, rows) of the controlling terminal."""
+    try:
+        packed = fcntl.ioctl(sys.stdin.fileno(), termios.TIOCGWINSZ, b"\0" * 8)
+        rows, cols = struct.unpack("HHHH", packed)[:2]
+        return (cols or 80, rows or 24)
+    except OSError:
+        return (80, 24)
+
+
 def _set_winsize_from_stdin(master_fd: int) -> None:
     try:
         packed = fcntl.ioctl(sys.stdin.fileno(), termios.TIOCGWINSZ, b"\0" * 8)
@@ -53,12 +63,16 @@ def _open_inject_fifo() -> int:
     return fd
 
 
-def run(cmd: list[str], on_ready=None) -> int:
+def run(cmd: list[str], on_ready=None, on_prompt=None) -> int:
     """Spawn cmd under a PTY and mux I/O until it exits. Returns exit code.
 
     `on_ready` (if given) is called once the PTY child and inject FIFO reader are
     live but before the mux loop — used by `mvibe up` to start the bridge threads
     in-process only after a FIFO reader exists (so injects never hit ENXIO).
+
+    `on_prompt` (if given) receives a prompt_detect.Prompt when an interactive
+    confirmation appears on screen, and None when it clears — used to forward
+    confirmations to the phone.
     """
     if not cmd:
         cmd = ["claude"]
@@ -68,13 +82,25 @@ def run(cmd: list[str], on_ready=None) -> int:
     if paths.read_flag() != "local":
         paths.write_flag("local")
 
+    watcher = None
+    if on_prompt is not None:
+        from .prompt_detect import PromptWatcher
+
+        cols, rows = _winsize()
+        watcher = PromptWatcher(cols, rows, on_prompt)
+
     pid, master_fd = pty.fork()
     if pid == 0:  # child
         os.execvp(cmd[0], cmd)
         os._exit(127)  # unreachable on success
 
+    def _on_winch(*_):
+        _set_winsize_from_stdin(master_fd)
+        if watcher is not None:
+            watcher.resize(*_winsize())
+
     _set_winsize_from_stdin(master_fd)
-    signal.signal(signal.SIGWINCH, lambda *_: _set_winsize_from_stdin(master_fd))
+    signal.signal(signal.SIGWINCH, _on_winch)
 
     inject_fd = _open_inject_fifo()
 
@@ -108,6 +134,8 @@ def run(cmd: list[str], on_ready=None) -> int:
                 if not data:
                     break  # child exited / PTY closed
                 os.write(stdout_fd, data)
+                if watcher is not None:
+                    watcher.feed(data)
 
             if stdin_fd in rlist:
                 try:
@@ -135,6 +163,8 @@ def run(cmd: list[str], on_ready=None) -> int:
                     os.write(master_fd, data)
                 # local mode: injected bytes are dropped on purpose.
     finally:
+        if watcher is not None:
+            watcher.stop()
         if old_attr is not None:
             termios.tcsetattr(stdin_fd, termios.TCSAFLUSH, old_attr)
         try:
