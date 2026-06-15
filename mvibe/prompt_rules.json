@@ -30,5 +30,9 @@
     "esc to cancel",
     "tab to amend",
     "to explain"
-  ]
+  ],
+
+  "_inject_comment": "Keystroke injection: send the text, wait submit_delay_ms, then send submit_key (Enter) as a separate keystroke so the TUI submits instead of treating the Enter as a pasted newline.",
+  "submit_key": "\r",
+  "submit_delay_ms": 80
 }

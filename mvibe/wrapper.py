@@ -25,6 +25,7 @@ import signal
 import struct
 import sys
 import termios
+import time
 import tty
 
 from . import paths
@@ -188,7 +189,13 @@ def _sanitize_injection(text: str) -> str:
 
 
 def inject(text: str, submit: bool = True) -> None:
-    """Write keystrokes into the inject FIFO. `submit` appends CR to send the line.
+    """Write keystrokes into the inject FIFO.
+
+    When `submit`, the text and the Enter key are written as two separate writes
+    with a short delay between them, so the TUI registers the text first and then
+    a distinct Enter — sending them together can be coalesced into a paste (the
+    Enter becomes a literal newline in the input box instead of submitting).
+    Submit key and delay come from config (submit_key / submit_delay_ms).
 
     Opens non-blocking: if no wrapper is reading the FIFO (no `mvibe run`), the
     open fails with ENXIO rather than blocking forever — we surface that as a
@@ -197,7 +204,6 @@ def inject(text: str, submit: bool = True) -> None:
     fifo = paths.INJECT_FIFO
     if not fifo.exists():
         raise FileNotFoundError(f"inject FIFO missing: {fifo} (is `mvibe run` active?)")
-    payload = _sanitize_injection(text) + ("\r" if submit else "")
     try:
         fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
     except OSError as exc:
@@ -205,6 +211,10 @@ def inject(text: str, submit: bool = True) -> None:
             raise RuntimeError("`mvibe run` is not active (no reader on inject FIFO)") from exc
         raise
     try:
-        os.write(fd, payload.encode("utf-8"))
+        os.write(fd, _sanitize_injection(text).encode("utf-8"))
+        if submit:
+            rules = paths.load_rules()
+            time.sleep(max(0, int(rules.get("submit_delay_ms", 80))) / 1000)
+            os.write(fd, str(rules.get("submit_key", "\r")).encode("utf-8"))
     finally:
         os.close(fd)

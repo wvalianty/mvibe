@@ -13,13 +13,13 @@ from __future__ import annotations
 
 import codecs
 import hashlib
-import json
 import re
 import threading
 import time
-from pathlib import Path
 
 import pyte
+
+from . import paths
 
 # A numbered option line, e.g. "❯ 1. Yes" / "│ 2. No ... │" (leading box/cursor
 # chars allowed; trailing box chars stripped from the captured label).
@@ -27,22 +27,16 @@ _OPT_RE = re.compile(r"^[\s>❯▶►●○*\-│┃|]*([0-9])[.)]\s+(\S.*?)[\s�
 
 _BOX = "│┃┆┇╎╏┊┋ ╭╮╰╯─━┌┐└┘├┤ ❯▶►➤●○"
 
-# Detection keywords live in config so they can be tuned without touching logic.
-_RULES_FILE = Path(__file__).with_name("prompt_rules.json")  # shipped defaults
-_RULES_OVERRIDE = Path.home() / ".mvibe" / "prompt_rules.json"  # optional user override
-_rules_cache: dict | None = None
+# Detection keywords come from config (paths.load_rules); here we post-process
+# them (lowercasing, regex compile) and cache the processed view.
+_processed: dict | None = None
 
 
 def _load_rules() -> dict:
-    global _rules_cache
-    if _rules_cache is not None:
-        return _rules_cache
-    rules: dict = {}
-    for path in (_RULES_FILE, _RULES_OVERRIDE):
-        try:
-            rules.update(json.loads(path.read_text(encoding="utf-8")))
-        except (FileNotFoundError, json.JSONDecodeError):
-            continue
+    global _processed
+    if _processed is not None:
+        return _processed
+    rules = dict(paths.load_rules())
     # Pre-lower keyword lists for case-insensitive matching.
     rules["confirm_phrases"] = [s.lower() for s in rules.get("confirm_phrases", [])]
     rules["option_keywords"] = [s.lower() for s in rules.get("option_keywords", [])]
@@ -56,7 +50,7 @@ def _load_rules() -> dict:
     rules.setdefault("separator_min_len", 10)
     rules.setdefault("context_lines_above", 6)
     rules["_yn"] = re.compile(rules["yn_regex"]) if rules.get("yn_regex") else None
-    _rules_cache = rules
+    _processed = rules
     return rules
 
 

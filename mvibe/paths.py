@@ -6,6 +6,7 @@ transcript directory (~/.claude/projects). No dependency on any avibe install.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from pathlib import Path
@@ -29,6 +30,28 @@ WECHAT_SYNC_BUF = STATE_DIR / "wechat_sync_buf"
 WECHAT_TOKENS = STATE_DIR / "wechat_context_tokens.json"
 
 CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
+
+
+# Behavior config (detection keywords + injection): shipped defaults, optionally
+# overridden by ~/.mvibe/prompt_rules.json. Lightweight loader (no pyte) so both
+# the wrapper and the detector can read it.
+_RULES_FILE = Path(__file__).with_name("prompt_rules.json")
+RULES_OVERRIDE = MVIBE_HOME / "prompt_rules.json"
+_rules_cache: dict | None = None
+
+
+def load_rules() -> dict:
+    global _rules_cache
+    if _rules_cache is not None:
+        return _rules_cache
+    rules: dict = {}
+    for path in (_RULES_FILE, RULES_OVERRIDE):
+        try:
+            rules.update(json.loads(path.read_text(encoding="utf-8")))
+        except (FileNotFoundError, json.JSONDecodeError):
+            continue
+    _rules_cache = rules
+    return rules
 
 
 def ensure_home() -> None:
