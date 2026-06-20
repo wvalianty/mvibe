@@ -36,10 +36,24 @@
 
 ## 安装
 
+从 PyPI 装（推荐）：
+
 ```bash
-uv tool install --editable /path/to/mvibe    # 把 mvibe 装上全局 PATH
-cp /path/to/mvibe/commands/mvibe-*.md ~/.claude/commands/   # 装会话内 slash 开关
+uv tool install mvibe                         # 把 mvibe 装上全局 PATH
 mvibe login                                   # 一次性：扫码绑定微信 bot
+```
+
+会话内 slash 开关（`/mvibe-on` 等）需从仓库拷模板到 `~/.claude/commands/`：
+
+```bash
+git clone https://github.com/wvalianty/mvibe
+cp mvibe/commands/mvibe-*.md ~/.claude/commands/
+```
+
+本地开发（editable）：
+
+```bash
+uv tool install --editable /path/to/mvibe
 ```
 
 依赖仅 `aiohttp` + `segno`（PyPI），**零 avibe 依赖**。

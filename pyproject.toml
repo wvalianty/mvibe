@@ -2,12 +2,35 @@
 name = "mvibe"
 version = "0.1.0"
 description = "Mirror a local Claude Code TUI to a remote chat (WeChat). Local stays identical; remote takes over I/O via a flag file."
+readme = "README.md"
 requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Yong Wang", email = "yong.wang@cobo.com" }]
+keywords = ["claude", "claude-code", "tui", "wechat", "remote", "pty", "mirror"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Terminals",
+    "Topic :: Communications :: Chat",
+]
 dependencies = [
     "aiohttp>=3.9",
     "pyte>=0.8.2",
     "segno>=1.6",
 ]
+
+[project.urls]
+Homepage = "https://github.com/wvalianty/mvibe"
+Repository = "https://github.com/wvalianty/mvibe"
+Issues = "https://github.com/wvalianty/mvibe/issues"
 
 [project.scripts]
 mvibe = "mvibe.cli:main"
