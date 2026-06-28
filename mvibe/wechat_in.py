@@ -65,8 +65,11 @@ async def poll_forever(on_message: OnMessage, stop: asyncio.Event | None = None)
         errcode = resp.get("errcode")
         if (ret not in (None, 0)) or (errcode not in (None, 0)):
             fails += 1
-            print(f"[wechat_in] getUpdates ret={ret} errcode={errcode} "
-                  f"msg={resp.get('errmsg') or resp.get('msg')}", flush=True)
+            print(
+                f"[wechat_in] getUpdates ret={ret} errcode={errcode} "
+                f"msg={resp.get('errmsg') or resp.get('msg')}",
+                flush=True,
+            )
             await asyncio.sleep(_LONG_RETRY_S if fails >= _MAX_FAILS else _SHORT_RETRY_S)
             continue
 

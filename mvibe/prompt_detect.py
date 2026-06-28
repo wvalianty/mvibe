@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import codecs
 import hashlib
+import os
 import re
 import threading
 import time
@@ -40,6 +41,13 @@ def _load_rules() -> dict:
     # Pre-lower keyword lists for case-insensitive matching.
     rules["confirm_phrases"] = [s.lower() for s in rules.get("confirm_phrases", [])]
     rules["option_keywords"] = [s.lower() for s in rules.get("option_keywords", [])]
+    # AskUserQuestion anchors double as an option_signal: fold them into the
+    # keyword list so the detection gate fires, and keep them separate so detect()
+    # can tag the prompt kind "ask".
+    rules["ask_anchors"] = [s.lower() for s in rules.get("ask_anchors", [])]
+    for a in rules["ask_anchors"]:
+        if a not in rules["option_keywords"]:
+            rules["option_keywords"].append(a)
     rules["yesno_option_prefixes"] = tuple(
         s.lower() for s in rules.get("yesno_option_prefixes", [])
     )
@@ -59,8 +67,8 @@ class Prompt:
 
     def __init__(self, text: str, options: list[tuple[str, str]], kind: str):
         self.text = text
-        self.options = options  # [(digit, label), ...] for kind == "numbered"
-        self.kind = kind  # "numbered" | "yn"
+        self.options = options  # [(digit, label), ...] for "numbered"/"ask"
+        self.kind = kind  # "numbered" | "yn" | "ask"
         self.hash = hashlib.sha1(text.encode("utf-8")).hexdigest()[:12]
 
 
@@ -89,8 +97,11 @@ def _extract_box(tail: list[str], rules: dict) -> str:
         block = tail[sep_idx + 1 :]
     else:
         qi = next(
-            (i for i, ln in enumerate(tail)
-             if any(p in ln.lower() for p in rules["confirm_phrases"])),
+            (
+                i
+                for i, ln in enumerate(tail)
+                if any(p in ln.lower() for p in rules["confirm_phrases"])
+            ),
             None,
         )
         block = tail[max(0, qi - rules["context_lines_above"]) :] if qi is not None else tail
@@ -106,6 +117,38 @@ def _extract_box(tail: list[str], rules: dict) -> str:
             continue
         out.append(s)
     return "\n".join(out)
+
+
+def _is_tabbar(line: str) -> bool:
+    """The AskUserQuestion carousel tab row, e.g. '←  ☐ 饮品  ☑ 去处  ✔ Submit  →'."""
+    s = line.strip()
+    if not s:
+        return False
+    return ("✔" in s and "submit" in s.lower()) or s.startswith(("←", "→"))
+
+
+def _extract_ask(tail: list[str], options: list[tuple[str, str]], rules: dict) -> str:
+    """Build the forwarded text for an AskUserQuestion screen: the question line
+    plus its real options (dropping the auto-appended ask_anchors). The generic
+    box extractor can't be used here — a horizontal rule sits *between* the
+    options, so it would keep only the trailing slice."""
+    # Locate the first numbered option line; the question is the nearest text line
+    # above it that is not the tab bar, a separator, or an option/description.
+    first_opt = next((i for i, ln in enumerate(tail) if _OPT_RE.match(ln)), None)
+    question = ""
+    if first_opt is not None:
+        for ln in reversed(tail[:first_opt]):
+            s = _strip_box(ln)
+            if not s or _is_separator(ln, rules) or _is_tabbar(ln):
+                continue
+            question = s
+            break
+
+    anchors = rules["ask_anchors"]
+    real = [(d, label) for d, label in options if not any(a in label.lower() for a in anchors)]
+    lines_out = [question] if question else []
+    lines_out += [f"{d}. {label}" for d, label in real]
+    return "\n".join(lines_out)
 
 
 def detect(lines: list[str]) -> Prompt | None:
@@ -127,8 +170,6 @@ def detect(lines: list[str]) -> Prompt | None:
         if m:
             options.append((m.group(1), m.group(2).strip()))
 
-    text = _extract_box(tail, rules)
-
     if len(options) >= rules["min_options"]:
         has_phrase = any(p in low for p in rules["confirm_phrases"])
         kws = rules["option_keywords"]
@@ -138,10 +179,16 @@ def detect(lines: list[str]) -> Prompt | None:
             or (prefixes and label.lower().startswith(prefixes))
             for _, label in options
         )
+        anchors = rules["ask_anchors"]
+        is_ask = bool(anchors) and any(
+            any(a in label.lower() for a in anchors) for _, label in options
+        )
+        if is_ask:
+            return Prompt(_extract_ask(tail, options, rules), options, "ask")
         if has_phrase or opt_signal:
-            return Prompt(text, options, "numbered")
+            return Prompt(_extract_box(tail, rules), options, "numbered")
     if rules["_yn"] is not None and rules["_yn"].search(joined):
-        return Prompt(text, [], "yn")
+        return Prompt(_extract_box(tail, rules), [], "yn")
     return None
 
 
@@ -159,6 +206,18 @@ class PromptWatcher:
         self._last_feed = 0.0
         self._dirty = False
         self._active_hash: str | None = None
+        # Debug capture: when MVIBE_DEBUG_SCREEN points at a dir, every settled
+        # snapshot is dumped there (regardless of detection) so prompt shapes that
+        # detect() currently misses — e.g. the AskUserQuestion carousel — can be
+        # inspected from real renders. Off unless the env var is set.
+        self._dbg_dir = os.environ.get("MVIBE_DEBUG_SCREEN") or None
+        self._dbg_last: str | None = None
+        self._dbg_n = 0
+        if self._dbg_dir:
+            try:
+                os.makedirs(self._dbg_dir, exist_ok=True)
+            except OSError:
+                self._dbg_dir = None
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
@@ -222,6 +281,8 @@ class PromptWatcher:
                     lines = self._snapshot()
                     self._dirty = False
 
+                if self._dbg_dir:
+                    self._dbg_dump(lines)
                 prompt = detect(lines)
                 if prompt is not None:
                     if prompt.hash != self._active_hash:
@@ -234,6 +295,22 @@ class PromptWatcher:
                 # Never let a render/detect error kill the thread or print a
                 # traceback into the TUI.
                 self._dirty = False
+
+    def _dbg_dump(self, lines: list[str]) -> None:
+        """Write a settled snapshot to MVIBE_DEBUG_SCREEN dir when it changed.
+        Keeps a rolling set of files screen-0000.txt .. so a multi-screen flow
+        (e.g. the AskUserQuestion carousel) is captured frame by frame."""
+        body = "\n".join(lines).rstrip()
+        if not body or body == self._dbg_last:
+            return
+        self._dbg_last = body
+        try:
+            path = os.path.join(self._dbg_dir, f"screen-{self._dbg_n:04d}.txt")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(body + "\n")
+            self._dbg_n += 1
+        except OSError:
+            pass
 
     def _safe_emit(self, prompt) -> None:
         try:

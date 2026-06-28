@@ -188,6 +188,38 @@ def _sanitize_injection(text: str) -> str:
     return "".join(ch for ch in text if ch in "\t\n" or ord(ch) >= 0x20)
 
 
+# Symbolic navigation keys -> raw terminal byte sequences. Used to drive TUI
+# menus that ignore digit keys (the AskUserQuestion carousel navigates with
+# arrows + Enter). These are mvibe-generated control codes, written raw on
+# purpose: _sanitize_injection (which strips ESC) is bypassed for this fixed
+# whitelist only — never for remote free text.
+_KEY_BYTES: dict[str, bytes] = {
+    "up": b"\x1b[A",
+    "down": b"\x1b[B",
+    "right": b"\x1b[C",
+    "left": b"\x1b[D",
+    "enter": b"\r",
+    "return": b"\r",
+    "space": b" ",
+    "tab": b"\t",
+    "esc": b"\x1b",
+}
+
+
+def _open_inject_write() -> int:
+    """Open the inject FIFO for writing (non-blocking). Raises a clear error when
+    no `mvibe run` wrapper is reading it, instead of blocking forever."""
+    fifo = paths.INJECT_FIFO
+    if not fifo.exists():
+        raise FileNotFoundError(f"inject FIFO missing: {fifo} (is `mvibe run` active?)")
+    try:
+        return os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+    except OSError as exc:
+        if exc.errno == errno.ENXIO:
+            raise RuntimeError("`mvibe run` is not active (no reader on inject FIFO)") from exc
+        raise
+
+
 def inject(text: str, submit: bool = True) -> None:
     """Write keystrokes into the inject FIFO.
 
@@ -196,25 +228,33 @@ def inject(text: str, submit: bool = True) -> None:
     a distinct Enter — sending them together can be coalesced into a paste (the
     Enter becomes a literal newline in the input box instead of submitting).
     Submit key and delay come from config (submit_key / submit_delay_ms).
-
-    Opens non-blocking: if no wrapper is reading the FIFO (no `mvibe run`), the
-    open fails with ENXIO rather than blocking forever — we surface that as a
-    clear error instead of hanging the caller's loop.
     """
-    fifo = paths.INJECT_FIFO
-    if not fifo.exists():
-        raise FileNotFoundError(f"inject FIFO missing: {fifo} (is `mvibe run` active?)")
-    try:
-        fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
-    except OSError as exc:
-        if exc.errno == errno.ENXIO:
-            raise RuntimeError("`mvibe run` is not active (no reader on inject FIFO)") from exc
-        raise
+    fd = _open_inject_write()
     try:
         os.write(fd, _sanitize_injection(text).encode("utf-8"))
         if submit:
             rules = paths.load_rules()
             time.sleep(max(0, int(rules.get("submit_delay_ms", 80))) / 1000)
             os.write(fd, str(rules.get("submit_key", "\r")).encode("utf-8"))
+    finally:
+        os.close(fd)
+
+
+def inject_keys(names: list[str], delay_ms: int = 40) -> None:
+    """Inject a sequence of symbolic navigation keys (see _KEY_BYTES), one at a
+    time with a short gap so the TUI processes each as a distinct keypress.
+    Unknown names are skipped. Bypasses the text sanitizer by design — only the
+    fixed _KEY_BYTES whitelist is emitted."""
+    fd = _open_inject_write()
+    try:
+        first = True
+        for name in names:
+            b = _KEY_BYTES.get(name.strip().lower())
+            if b is None:
+                continue
+            if not first:
+                time.sleep(max(0, delay_ms) / 1000)
+            os.write(fd, b)
+            first = False
     finally:
         os.close(fd)

@@ -7,12 +7,20 @@
   "confirm_phrases": [
     "do you want to",
     "would you like to",
-    "do you trust"
+    "do you trust",
+    "ready to submit"
   ],
 
   "option_keywords": [
     "ask again",
     "tell claude"
+  ],
+
+  "_ask_comment": "AskUserQuestion carousel: every question screen auto-appends 'Type something.' + 'Chat about this', and the final screen offers 'Submit answers'. These labels uniquely identify that widget, which is navigated by arrows+Enter (NOT digit keys). We (a) treat them as an option_signal for detection and (b) tag the prompt kind 'ask' so the reply path drives it with arrow keys and the text extractor pulls the question + real options (its option list is split by a horizontal rule the generic box extractor mishandles).",
+  "ask_anchors": [
+    "type something",
+    "chat about this",
+    "submit answers"
   ],
 
   "yesno_option_prefixes": [

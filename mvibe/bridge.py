@@ -117,8 +117,13 @@ def on_prompt_change(prompt) -> None:
         if _pending is not None:
             return
         _pending = {"options": prompt.options, "kind": prompt.kind}
-    hint = "回复 yes / no" if prompt.kind == "yn" else "回复选项数字，或 yes / no"
-    msg = f"⚠️ 需要确认：\n\n{prompt.text}\n\n（{hint}）"
+    if prompt.kind == "ask":
+        header, hint = "❓ 需要选择", "回复选项数字（如 1）"
+    elif prompt.kind == "yn":
+        header, hint = "⚠️ 需要确认", "回复 yes / no"
+    else:
+        header, hint = "⚠️ 需要确认", "回复选项数字，或 yes / no"
+    msg = f"{header}：\n\n{prompt.text}\n\n（{hint}）"
     if _safe_send(msg):
         _log(f"[approve] forwarded prompt ({prompt.kind}, {len(prompt.options)} opts)")
     else:
@@ -153,6 +158,26 @@ def _map_reply(text: str, pending: dict) -> str | None:
     return None
 
 
+def _ask_keys(text: str, options: list[tuple[str, str]]) -> list[str] | None:
+    """Map a phone reply to the arrow-key sequence that answers an AskUserQuestion
+    screen. Its menu ignores digit keys: the highlight starts on the first option,
+    so option N is reached with (N-1) Down presses then Enter. yes/no select the
+    first/last option as a convenience (e.g. Submit vs Cancel)."""
+    t = text.strip()
+    digits = [d for d, _ in options]
+    if t in digits:
+        n = int(t)
+        return ["down"] * (n - 1) + ["enter"]
+    tl = t.lower()
+    if not options:
+        return None
+    if tl in _YES_WORDS:
+        return ["enter"]  # first option (default highlight)
+    if tl in _NO_WORDS:
+        return ["down"] * (len(options) - 1) + ["enter"]  # last option
+    return None
+
+
 def _try_answer_pending(text: str) -> bool:
     """If a confirmation is pending, treat `text` as the answer. Returns True if
     handled (so it is not injected as an ordinary message)."""
@@ -161,6 +186,22 @@ def _try_answer_pending(text: str) -> bool:
         pending = _pending
     if pending is None:
         return False
+
+    if pending["kind"] == "ask":
+        keys = _ask_keys(text, pending["options"])
+        if keys is None:
+            _safe_send("没听懂，请回复选项数字（如 1）")
+            return True
+        paths.write_flag("remote")
+        try:
+            wrapper.inject_keys(keys)  # arrow nav + Enter; digit keys are ignored here
+        except Exception as exc:
+            _log(f"[approve] ask inject failed: {exc}")
+        with _pending_lock:
+            _pending = None
+        _log(f"[approve] ask reply {text!r} -> keys {keys}")
+        return True
+
     key = _map_reply(text, pending)
     if key is None:
         _safe_send("没听懂，请回复选项数字或 yes / no")

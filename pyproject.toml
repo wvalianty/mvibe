@@ -46,3 +46,8 @@ artifacts = ["mvibe/prompt_rules.json"]
 [tool.ruff]
 line-length = 100
 extend-exclude = ["mvibe/ilink"]  # vendored upstream iLink code
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
